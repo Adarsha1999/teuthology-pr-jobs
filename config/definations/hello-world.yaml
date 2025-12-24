@@ -1,0 +1,13 @@
+- job:
+    name: hello-world
+    description: 'A simple Hello World pipeline job deployed with JJB'
+    project-type: pipeline
+    sandbox: true
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/Adarsha1999/teuthology-pr-jobs.git
+            branches:
+              - main
+      script-path: build/Jenkinsfile
+      lightweight-checkout: true
