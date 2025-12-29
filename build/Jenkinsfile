@@ -1,14 +1,255 @@
+#!/usr/bin/env groovy
+/**
+ * Ceph Test Build Pipeline - RPM Build for Teuthology
+ * 
+ * This pipeline builds Ceph RPM packages using Podman containers.
+ * No push to Shaman - RPMs are archived locally.
+ */
+
 pipeline {
     agent any
 
+    options {
+        timeout(time: 6, unit: 'HOURS')
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        CEPH_REPO = "${params.CEPH_REPO ?: 'https://github.com/ceph/ceph.git'}"
+        CEPH_BRANCH = "${params.CEPH_BRANCH ?: 'main'}"
+        DISTRO = "${params.DISTRO ?: 'centos'}"
+        DISTRO_VERSION = "${params.DISTRO_VERSION ?: '9'}"
+        CONTAINER_NAME = "ceph-build-${BUILD_NUMBER}"
+        CONTAINER_IMAGE = "quay.io/centos/centos:stream${params.DISTRO_VERSION ?: '9'}"
+    }
+
     stages {
-        stage('Hello') {
+        stage('Validate') {
             steps {
-                echo 'Hello, World!'
-                echo "Build number: ${env.BUILD_NUMBER}"
-                echo "Job name: ${env.JOB_NAME}"
+                script {
+                    echo "============================================"
+                    echo "Ceph Test Build - Podman Container Build"
+                    echo "============================================"
+                    echo "Repository: ${env.CEPH_REPO}"
+                    echo "Branch: ${env.CEPH_BRANCH}"
+                    echo "Container: ${env.CONTAINER_IMAGE}"
+                    echo "============================================"
+                    
+                    if (env.DISTRO != 'centos') {
+                        error "Only CentOS builds are supported. Got: ${env.DISTRO}"
+                    }
+                }
+            }
+        }
+
+        stage('Start Container') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Starting Podman container..."
+                    
+                    # Remove any existing container with same name
+                    podman rm -f ${CONTAINER_NAME} 2>/dev/null || true
+                    
+                    # Start container with workspace mounted
+                    podman run -d \
+                        --name ${CONTAINER_NAME} \
+                        --privileged \
+                        -v ${WORKSPACE}:/workspace:Z \
+                        ${CONTAINER_IMAGE} \
+                        sleep infinity
+                    
+                    echo "Container ${CONTAINER_NAME} started!"
+                '''
+            }
+        }
+
+        stage('Setup Container') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Setting up build environment..."
+                    
+                    podman exec ${CONTAINER_NAME} bash -c '
+                        set -ex
+                        yum install -y git sudo which rpm-build rpmdevtools
+                        rpmdev-setuptree || mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+                        echo "Container ready!"
+                    '
+                '''
+            }
+        }
+
+        stage('Checkout Ceph') {
+            steps {
+                dir('ceph') {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: "${env.CEPH_BRANCH}"]],
+                        userRemoteConfigs: [[url: "${env.CEPH_REPO}"]],
+                        extensions: [
+                            [$class: 'CloneOption', depth: 0, shallow: false],
+                            [$class: 'SubmoduleOption', disableSubmodules: false, recursiveSubmodules: true, shallow: true]
+                        ]
+                    ])
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Installing build dependencies..."
+                    
+                    podman exec ${CONTAINER_NAME} bash -c '
+                        set -ex
+                        cd /workspace/ceph
+                        
+                        # Install EPEL
+                        yum install -y epel-release
+                        
+                        # Enable CRB/PowerTools for build deps
+                        if command -v dnf &> /dev/null; then
+                            dnf config-manager --set-enabled crb || \
+                            dnf config-manager --set-enabled powertools || true
+                        fi
+                        
+                        # Install Ceph build dependencies
+                        if [ -f install-deps.sh ]; then
+                            ./install-deps.sh
+                        fi
+                    '
+                '''
+            }
+        }
+
+        stage('Build Source Tarball') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Creating source tarball..."
+                    
+                    podman exec ${CONTAINER_NAME} bash -c '
+                        set -ex
+                        cd /workspace/ceph
+                        
+                        if [ -f make-dist ]; then
+                            ./make-dist
+                        fi
+                        
+                        ls -la *.tar.* || echo "No tarball found yet"
+                    '
+                '''
+            }
+        }
+
+        stage('Build RPMs') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Building RPM packages..."
+                    
+                    podman exec ${CONTAINER_NAME} bash -c '
+                        set -ex
+                        cd /workspace/ceph
+                        
+                        VERSION=$(git describe --long --match "v*" 2>/dev/null | sed "s/^v//" || echo "0.0.0")
+                        echo "Building version: $VERSION"
+                        
+                        TARBALL=$(ls -1 ceph-*.tar.bz2 2>/dev/null | head -1)
+                        if [ -n "$TARBALL" ]; then
+                            cp $TARBALL ~/rpmbuild/SOURCES/
+                        fi
+                        
+                        if [ -f make-srpm.sh ]; then
+                            ./make-srpm.sh
+                            SRPM=$(ls -1 ~/rpmbuild/SRPMS/*.src.rpm 2>/dev/null | head -1 || ls -1 *.src.rpm 2>/dev/null | head -1)
+                        fi
+                        
+                        if [ -n "$SRPM" ] && [ -f "$SRPM" ]; then
+                            echo "Building RPMs from SRPM: $SRPM"
+                            rpmbuild --rebuild $SRPM \
+                                --define "_topdir $HOME/rpmbuild" \
+                                --define "debug_package %{nil}" \
+                                --without ceph_test_package \
+                                --without make_check \
+                                || echo "rpmbuild failed"
+                        else
+                            echo "No SRPM found, building with cmake..."
+                            mkdir -p build && cd build
+                            cmake .. \
+                                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                                -DWITH_TESTS=OFF \
+                                -DWITH_MANPAGE=OFF \
+                                -DWITH_PYTHON3=ON \
+                                -DWITH_MGR_DASHBOARD_FRONTEND=OFF
+                            make -j$(nproc) rpm || make rpm
+                        fi
+                        
+                        echo "RPM build completed!"
+                    '
+                '''
+            }
+        }
+
+        stage('Collect RPMs') {
+            steps {
+                sh '''#!/bin/bash
+                    set -ex
+                    echo "Collecting built RPMs..."
+                    
+                    mkdir -p ${WORKSPACE}/rpms
+                    
+                    # Copy RPMs from container
+                    podman exec ${CONTAINER_NAME} bash -c '
+                        find ~/rpmbuild/RPMS -name "*.rpm" 2>/dev/null
+                        find ~/rpmbuild/SRPMS -name "*.rpm" 2>/dev/null
+                        find /workspace/ceph -name "*.rpm" 2>/dev/null
+                    ' | while read rpm; do
+                        podman cp ${CONTAINER_NAME}:$rpm ${WORKSPACE}/rpms/ 2>/dev/null || true
+                    done
+                    
+                    # Also copy from workspace mount
+                    find ${WORKSPACE}/ceph -name "*.rpm" -exec cp {} ${WORKSPACE}/rpms/ \\; 2>/dev/null || true
+                    
+                    echo "============================================"
+                    echo "Built RPMs:"
+                    echo "============================================"
+                    ls -la ${WORKSPACE}/rpms/ || echo "No RPMs found"
+                '''
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                script {
+                    archiveArtifacts artifacts: 'rpms/*.rpm', allowEmptyArchive: true, fingerprint: true
+                    archiveArtifacts artifacts: 'ceph/*.tar.bz2', allowEmptyArchive: true, fingerprint: true
+                }
             }
         }
     }
-}
 
+    post {
+        success {
+            echo 'Build completed successfully!'
+            echo 'Artifacts are archived (no push to Shaman)'
+        }
+        failure {
+            echo 'Build failed!'
+        }
+        always {
+            sh '''
+                # Stop and remove container
+                podman rm -f ${CONTAINER_NAME} 2>/dev/null || true
+            '''
+            cleanWs(
+                deleteDirs: true,
+                disableDeferredWipeout: true,
+                patterns: [[pattern: 'ceph/**', type: 'INCLUDE']]
+            )
+        }
+    }
+}

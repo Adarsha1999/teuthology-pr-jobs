@@ -1,0 +1,45 @@
+- job:
+    name: ceph-test-build
+    description: |
+      Test build for Ceph - CentOS only.
+      This job builds Ceph from a PR or branch for testing purposes.
+      No push to Shaman.
+    project-type: pipeline
+    sandbox: true
+    concurrent: true
+    properties:
+      - build-discarder:
+          days-to-keep: 30
+          num-to-keep: 30
+          artifact-days-to-keep: 30
+          artifact-num-to-keep: 30
+    parameters:
+      - string:
+          name: CEPH_REPO
+          default: 'https://github.com/ceph/ceph.git'
+          description: 'Ceph repository URL'
+      - string:
+          name: CEPH_BRANCH
+          default: 'main'
+          description: 'Branch or PR ref to build'
+      - string:
+          name: DISTRO
+          default: 'centos'
+          description: 'Distribution to build (centos only)'
+      - string:
+          name: DISTRO_VERSION
+          default: '9'
+          description: 'Distribution version (8 or 9)'
+      - bool:
+          name: BUILD_BINARIES
+          default: true
+          description: 'Build binary packages'
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/Adarsha1999/teuthology-pr-jobs.git
+            branches:
+              - main
+      script-path: build/Jenkinsfile
+      lightweight-checkout: true
+
