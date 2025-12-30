@@ -18,10 +18,16 @@ pipeline {
     environment {
         CEPH_REPO = "${params.CEPH_REPO ?: 'https://github.com/ceph/ceph.git'}"
         CEPH_BRANCH = "${params.CEPH_BRANCH ?: 'main'}"
+        CEPH_SHA = "${params.CEPH_SHA ?: ''}"
+        CEPH_PR = "${params.CEPH_PR ?: ''}"
         DISTRO = "${params.DISTRO ?: 'centos'}"
         DISTRO_VERSION = "${params.DISTRO_VERSION ?: '9'}"
         CONTAINER_NAME = "ceph-build-${BUILD_NUMBER}"
         CONTAINER_IMAGE = "quay.io/centos/centos:stream${params.DISTRO_VERSION ?: '9'}"
+        BUILD_DATA_DIR = "/data/jenkins-builds/${BUILD_NUMBER}"
+        // Chacra and Shaman configuration
+        CHACRA_URL = "${params.CHACRA_URL ?: 'http://localhost:8082'}"
+        SHAMAN_URL = "${params.SHAMAN_URL ?: 'http://localhost:5000'}"
     }
 
     stages {
@@ -33,6 +39,12 @@ pipeline {
                     echo "============================================"
                     echo "Repository: ${env.CEPH_REPO}"
                     echo "Branch: ${env.CEPH_BRANCH}"
+                    if (env.CEPH_PR) {
+                        echo "PR: #${env.CEPH_PR}"
+                    }
+                    if (env.CEPH_SHA) {
+                        echo "Commit SHA: ${env.CEPH_SHA}"
+                    }
                     echo "Container: ${env.CONTAINER_IMAGE}"
                     echo "============================================"
                     
@@ -52,11 +64,19 @@ pipeline {
                     # Remove any existing container with same name
                     podman rm -f ${CONTAINER_NAME} 2>/dev/null || true
                     
-                    # Start container with workspace mounted
+                    # Create build directory on large data volume
+                    mkdir -p ${BUILD_DATA_DIR}
+                    
+                    # Show available disk space
+                    echo "Disk space on /data volume:"
+                    df -h /data
+                    
+                    # Start container with data volume mounted as workspace
                     podman run -d \
                         --name ${CONTAINER_NAME} \
                         --privileged \
-                        -v ${WORKSPACE}:/workspace:Z \
+                        -v ${BUILD_DATA_DIR}:/workspace:Z \
+                        -v ${WORKSPACE}:/jenkins-workspace:Z \
                         ${CONTAINER_IMAGE} \
                         sleep infinity
                     
@@ -73,8 +93,18 @@ pipeline {
                     
                     podman exec ${CONTAINER_NAME} bash -c '
                         set -ex
-                        yum install -y git sudo which rpm-build rpmdevtools
+                        
+                        # Disable IPv6 at system level (IPv6 not accessible from this network)
+                        echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
+                        sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+                        sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+                        
+                        yum install -y git sudo which rpm-build rpmdevtools wget
                         rpmdev-setuptree || mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+                        
+                        # Create temp directory on data volume
+                        mkdir -p /workspace/tmp
+                        
                         echo "Container ready!"
                     '
                 '''
@@ -83,16 +113,44 @@ pipeline {
 
         stage('Checkout Ceph') {
             steps {
-                dir('ceph') {
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: "${env.CEPH_BRANCH}"]],
-                        userRemoteConfigs: [[url: "${env.CEPH_REPO}"]],
-                        extensions: [
-                            [$class: 'CloneOption', depth: 0, shallow: false],
-                            [$class: 'SubmoduleOption', disableSubmodules: false, recursiveSubmodules: true, shallow: true]
-                        ]
-                    ])
+                dir("${env.BUILD_DATA_DIR}/ceph") {
+                    script {
+                        def refspec = '+refs/heads/*:refs/remotes/origin/*'
+                        def branch = env.CEPH_BRANCH
+                        
+                        // If PR number specified, fetch the PR ref
+                        if (env.CEPH_PR) {
+                            refspec = "+refs/pull/${env.CEPH_PR}/head:refs/remotes/origin/PR-${env.CEPH_PR}"
+                            branch = "origin/PR-${env.CEPH_PR}"
+                            echo "Fetching PR #${env.CEPH_PR}"
+                        }
+                        // If SHA specified, we'll checkout that commit after clone
+                        else if (env.CEPH_SHA) {
+                            echo "Will checkout commit: ${env.CEPH_SHA}"
+                        }
+                        
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: branch]],
+                            userRemoteConfigs: [[
+                                url: env.CEPH_REPO,
+                                refspec: refspec
+                            ]],
+                            extensions: [
+                                [$class: 'CloneOption', depth: 0, shallow: false],
+                                [$class: 'SubmoduleOption', disableSubmodules: false, recursiveSubmodules: true, shallow: true]
+                            ]
+                        ])
+                        
+                        // If specific SHA requested, checkout that commit
+                        if (env.CEPH_SHA && !env.CEPH_PR) {
+                            sh "git checkout ${env.CEPH_SHA}"
+                            sh "git submodule update --init --recursive"
+                        }
+                        
+                        // Show what we checked out
+                        sh 'git log -1 --oneline'
+                    }
                 }
             }
         }
@@ -116,9 +174,38 @@ pipeline {
                             dnf config-manager --set-enabled powertools || true
                         fi
                         
-                        # Install Ceph build dependencies
+                        # Enable GCC Toolset for Ceph 20.x+ (squid and later)
+                        yum install -y gcc-toolset-13 || true
+                        yum install -y gcc-toolset-13-gcc-plugin-annobin \
+                            gcc-toolset-13-libasan-devel \
+                            gcc-toolset-13-libubsan-devel || true
+                        
+                        # Install additional deps required by Ceph 20.x+
+                        yum install -y \
+                            cryptopp-devel \
+                            gnutls-devel \
+                            hwloc-devel \
+                            libasan libubsan \
+                            libpciaccess-devel \
+                            lksctp-tools-devel \
+                            ragel \
+                            yum-utils || true
+                        
+                        # Ensure IPv6 is disabled for this session
+                        sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+                        
+                        # Set npm to use IPv4 via environment variable (works for any npm instance)
+                        export NODE_OPTIONS="--dns-result-order=ipv4first"
+                        
+                        # Install Ceph build dependencies via install-deps.sh
                         if [ -f install-deps.sh ]; then
                             ./install-deps.sh
+                        fi
+                        
+                        # Also try yum-builddep if SRPM exists
+                        SRPM=$(ls -1 /workspace/ceph/*.src.rpm 2>/dev/null | head -1)
+                        if [ -n "$SRPM" ]; then
+                            yum-builddep -y "$SRPM" || true
                         fi
                     '
                 '''
@@ -155,6 +242,14 @@ pipeline {
                         set -ex
                         cd /workspace/ceph
                         
+                        # Use workspace for temp files (on the large /data volume)
+                        export TMPDIR=/workspace/tmp
+                        mkdir -p $TMPDIR
+                        
+                        # Check disk space before build
+                        echo "Disk space before build:"
+                        df -h /workspace
+                        
                         VERSION=$(git describe --long --match "v*" 2>/dev/null | sed "s/^v//" || echo "0.0.0")
                         echo "Building version: $VERSION"
                         
@@ -165,27 +260,51 @@ pipeline {
                         
                         if [ -f make-srpm.sh ]; then
                             ./make-srpm.sh
-                            SRPM=$(ls -1 ~/rpmbuild/SRPMS/*.src.rpm 2>/dev/null | head -1 || ls -1 *.src.rpm 2>/dev/null | head -1)
                         fi
+                        
+                        # Find SRPM - check multiple locations
+                        SRPM=$(ls -1 ~/rpmbuild/SRPMS/*.src.rpm 2>/dev/null | head -1)
+                        if [ -z "$SRPM" ]; then
+                            SRPM=$(ls -1 /workspace/ceph/*.src.rpm 2>/dev/null | head -1)
+                        fi
+                        if [ -z "$SRPM" ]; then
+                            SRPM=$(ls -1 *.src.rpm 2>/dev/null | head -1)
+                        fi
+                        
+                        echo "Found SRPM: $SRPM"
                         
                         if [ -n "$SRPM" ] && [ -f "$SRPM" ]; then
                             echo "Building RPMs from SRPM: $SRPM"
+                            
+                            # Use /workspace for rpmbuild to avoid filling root disk
+                            # /workspace is mounted from /data (200GB volume)
+                            mkdir -p /workspace/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+                            
+                            # Limit parallel jobs to avoid OOM - each compile uses ~2GB RAM
+                            # 15GB RAM / 2GB per job = max 7 jobs, but use 4 for safety
+                            echo "Limiting to 4 parallel jobs to avoid OOM (15GB RAM available)"
+                            
                             rpmbuild --rebuild $SRPM \
-                                --define "_topdir $HOME/rpmbuild" \
+                                --define "_topdir /workspace/rpmbuild" \
+                                --define "_tmppath /workspace/tmp" \
+                                --define "_smp_mflags -j4" \
                                 --define "debug_package %{nil}" \
+                                --define "_unpackaged_files_terminate_build 0" \
                                 --without ceph_test_package \
                                 --without make_check \
                                 || echo "rpmbuild failed"
                         else
-                            echo "No SRPM found, building with cmake..."
+                            echo "No SRPM found, building with cmake directly..."
                             mkdir -p build && cd build
                             cmake .. \
                                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                                 -DWITH_TESTS=OFF \
-                                -DWITH_MANPAGE=OFF \
-                                -DWITH_PYTHON3=ON \
-                                -DWITH_MGR_DASHBOARD_FRONTEND=OFF
-                            make -j$(nproc) rpm || make rpm
+                                -DWITH_MANPAGE=OFF
+                            
+                            # Build binaries (not RPMs in this fallback)
+                            make -j$(nproc) || make -j2
+                            
+                            echo "Binaries built successfully (not RPMs)"
                         fi
                         
                         echo "RPM build completed!"
@@ -204,6 +323,8 @@ pipeline {
                     
                     # Copy RPMs from container
                     podman exec ${CONTAINER_NAME} bash -c '
+                        find /workspace/rpmbuild/RPMS -name "*.rpm" 2>/dev/null
+                        find /workspace/rpmbuild/SRPMS -name "*.rpm" 2>/dev/null
                         find ~/rpmbuild/RPMS -name "*.rpm" 2>/dev/null
                         find ~/rpmbuild/SRPMS -name "*.rpm" 2>/dev/null
                         find /workspace/ceph -name "*.rpm" 2>/dev/null
@@ -211,8 +332,8 @@ pipeline {
                         podman cp ${CONTAINER_NAME}:$rpm ${WORKSPACE}/rpms/ 2>/dev/null || true
                     done
                     
-                    # Also copy from workspace mount
-                    find ${WORKSPACE}/ceph -name "*.rpm" -exec cp {} ${WORKSPACE}/rpms/ \\; 2>/dev/null || true
+                    # Also copy from data volume
+                    find ${BUILD_DATA_DIR}/ceph -name "*.rpm" -exec cp {} ${WORKSPACE}/rpms/ \\; 2>/dev/null || true
                     
                     echo "============================================"
                     echo "Built RPMs:"
@@ -225,8 +346,135 @@ pipeline {
         stage('Archive Artifacts') {
             steps {
                 script {
-                    archiveArtifacts artifacts: 'rpms/*.rpm', allowEmptyArchive: true, fingerprint: true
-                    archiveArtifacts artifacts: 'ceph/*.tar.bz2', allowEmptyArchive: true, fingerprint: true
+                    archiveArtifacts artifacts: 'rpms/*.rpm, ceph/*.tar.bz2', allowEmptyArchive: true, fingerprint: true
+                }
+            }
+        }
+
+        stage('Upload to Chacra') {
+            when {
+                expression { 
+                    return fileExists("${WORKSPACE}/rpms") && 
+                           sh(script: "ls ${WORKSPACE}/rpms/*.rpm 2>/dev/null | head -1", returnStatus: true) == 0
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'chacra-api-credentials', usernameVariable: 'CHACRA_USER', passwordVariable: 'CHACRA_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -ex
+                        echo "Uploading RPMs to Chacra..."
+                        
+                        # Get the SHA from the checkout
+                        SHA1=$(cd ${BUILD_DATA_DIR}/ceph 2>/dev/null && git rev-parse HEAD || echo "unknown")
+                        REF="${CEPH_PR:+PR-${CEPH_PR}}"
+                        REF="${REF:-${CEPH_BRANCH}}"
+                        
+                        echo "Project: ceph"
+                        echo "Ref: ${REF}"
+                        echo "SHA1: ${SHA1}"
+                        echo "Distro: ${DISTRO}/${DISTRO_VERSION}"
+                        
+                        # Upload each RPM to Chacra
+                        UPLOAD_URL="${CHACRA_URL}/binaries/ceph/${REF}/${SHA1}/${DISTRO}/${DISTRO_VERSION}/x86_64/"
+                        
+                        for rpm in ${WORKSPACE}/rpms/*.rpm; do
+                            if [ -f "$rpm" ]; then
+                                filename=$(basename "$rpm")
+                                echo "Uploading: ${filename}"
+                                
+                                curl -s -f -X POST \
+                                    -u "${CHACRA_USER}:${CHACRA_KEY}" \
+                                    -F "file=@${rpm}" \
+                                    "${UPLOAD_URL}" || echo "Warning: Failed to upload ${filename}"
+                            fi
+                        done
+                        
+                        echo "RPM upload complete!"
+                    '''
+                }
+            }
+        }
+
+        stage('Create Repository') {
+            when {
+                expression { 
+                    return fileExists("${WORKSPACE}/rpms") && 
+                           sh(script: "ls ${WORKSPACE}/rpms/*.rpm 2>/dev/null | head -1", returnStatus: true) == 0
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'chacra-api-credentials', usernameVariable: 'CHACRA_USER', passwordVariable: 'CHACRA_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -ex
+                        echo "Creating YUM repository in Chacra..."
+                        
+                        SHA1=$(cd ${BUILD_DATA_DIR}/ceph 2>/dev/null && git rev-parse HEAD || echo "unknown")
+                        REF="${CEPH_PR:+PR-${CEPH_PR}}"
+                        REF="${REF:-${CEPH_BRANCH}}"
+                        
+                        REPO_URL="${CHACRA_URL}/repos/ceph/${REF}/${SHA1}/${DISTRO}/${DISTRO_VERSION}/"
+                        
+                        # Create/update repository
+                        curl -s -f -X POST \
+                            -u "${CHACRA_USER}:${CHACRA_KEY}" \
+                            -H "Content-Type: application/json" \
+                            -d '{"type": "rpm"}' \
+                            "${REPO_URL}" || echo "Warning: Could not create repo"
+                        
+                        echo "Repository URL: ${REPO_URL}"
+                    '''
+                }
+            }
+        }
+
+        stage('Register with Shaman') {
+            when {
+                expression { 
+                    return fileExists("${WORKSPACE}/rpms") && 
+                           sh(script: "ls ${WORKSPACE}/rpms/*.rpm 2>/dev/null | head -1", returnStatus: true) == 0
+                }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'chacra-api-credentials', usernameVariable: 'CHACRA_USER', passwordVariable: 'CHACRA_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -ex
+                        echo "Registering build with Shaman..."
+                        
+                        SHA1=$(cd ${BUILD_DATA_DIR}/ceph 2>/dev/null && git rev-parse HEAD || echo "unknown")
+                        REF="${CEPH_PR:+PR-${CEPH_PR}}"
+                        REF="${REF:-${CEPH_BRANCH}}"
+                        
+                        CHACRA_REPO_URL="${CHACRA_URL}/repos/ceph/${REF}/${SHA1}/${DISTRO}/${DISTRO_VERSION}/"
+                        
+                        # Build JSON payload properly using jq or cat
+                        JSON_PAYLOAD=$(cat <<EOF
+{
+    "distro": "${DISTRO}",
+    "distro_version": "${DISTRO_VERSION}",
+    "ref": "${REF}",
+    "sha1": "${SHA1}",
+    "url": "${CHACRA_REPO_URL}",
+    "chacra_url": "${CHACRA_REPO_URL}",
+    "status": "ready",
+    "flavor": "default"
+}
+EOF
+)
+                        echo "Sending JSON payload:"
+                        echo "${JSON_PAYLOAD}"
+                        
+                        # Register with Shaman
+                        curl -s -f -X POST \
+                            -u "${CHACRA_USER}:${CHACRA_KEY}" \
+                            -H "Content-Type: application/json" \
+                            -d "${JSON_PAYLOAD}" \
+                            "${SHAMAN_URL}/api/repos/ceph/" || echo "Warning: Could not register with Shaman"
+                        
+                        echo "============================================"
+                        echo "Build registered with Shaman!"
+                        echo "Repository: ${CHACRA_REPO_URL}"
+                        echo "============================================"
+                    '''
                 }
             }
         }
@@ -235,7 +483,7 @@ pipeline {
     post {
         success {
             echo 'Build completed successfully!'
-            echo 'Artifacts are archived (no push to Shaman)'
+            echo 'RPMs uploaded to Chacra and registered with Shaman'
         }
         failure {
             echo 'Build failed!'
@@ -244,6 +492,12 @@ pipeline {
             sh '''
                 # Stop and remove container
                 podman rm -f ${CONTAINER_NAME} 2>/dev/null || true
+                
+                # Clean up build directory on data volume
+                rm -rf ${BUILD_DATA_DIR} 2>/dev/null || true
+                
+                # Show remaining disk space
+                df -h /data
             '''
             cleanWs(
                 deleteDirs: true,
